@@ -23,6 +23,79 @@ Default disk growth is `+15G`.
 
 ## Basic Usage
 
+Run latest script directly from GitHub with `curl`. `chmod` is not needed when running through `bash`.
+
+Dry-run:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh) --dry-run
+```
+
+Apply default `+15G` to all VMs:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh)
+```
+
+Apply a custom size:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh) --size +25G
+```
+
+Apply to one VM:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh) --only-vmid 101 --size +25G
+```
+
+If process substitution is not available, use pipe mode:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh | bash -s -- --dry-run
+```
+
+Pipe mode apply:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh | bash
+```
+
+Download latest version from GitHub and run it on the Proxmox host:
+
+```bash
+tmp=/tmp/proxmox-vm-disk-expander && \
+rm -rf "$tmp" && \
+git clone --depth 1 https://github.com/sinitcad/proxmox-vm-disk-expander.git "$tmp" && \
+bash "$tmp/proxmox_expand_vm_disks.sh"
+```
+
+Dry-run directly from GitHub:
+
+```bash
+tmp=/tmp/proxmox-vm-disk-expander && \
+rm -rf "$tmp" && \
+git clone --depth 1 https://github.com/sinitcad/proxmox-vm-disk-expander.git "$tmp" && \
+bash "$tmp/proxmox_expand_vm_disks.sh" --dry-run
+```
+
+If `git` is not installed, fetch only the script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh \
+  -o /tmp/proxmox_expand_vm_disks.sh && \
+bash /tmp/proxmox_expand_vm_disks.sh --dry-run
+```
+
+Use `chmod +x` only if you want to run the downloaded file directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh \
+  -o /tmp/proxmox_expand_vm_disks.sh && \
+chmod +x /tmp/proxmox_expand_vm_disks.sh && \
+/tmp/proxmox_expand_vm_disks.sh --dry-run
+```
+
 Expand all VMs on the host by `+15G`:
 
 ```bash
