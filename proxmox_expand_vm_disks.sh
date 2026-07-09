@@ -7,6 +7,7 @@ include_templates=0
 vm_filter=""
 skip_space_check=0
 auto_disable_watchdog=1
+detach=1
 stop_timeout=300
 start_timeout=300
 guest_retry_attempts=4
@@ -34,7 +35,7 @@ Usage:
                               [--parallel 4] [--windows-exec-timeout 900]
                               [--pve-ok-gb 119] [--windows-ok-gb 118]
                               [--size +15G]
-                              [--no-watchdog-disable]
+                              [--no-detach] [--no-watchdog-disable]
 
 Expands one main QEMU disk per VM on the current Proxmox host.
 
@@ -77,9 +78,12 @@ Windows C: expansion, enabled by default:
   - Re-running is safe: after each disk growth it normalizes the tail reserve,
     so a 1 GiB reserve stays 1 GiB instead of accumulating every run
   - Job logs are streamed live to stdout and saved under /tmp
+  - Apply runs start through nohup by default so the job survives closing SSH
+  - Use --no-detach for foreground output in the current SSH session
 
 Examples:
   ./proxmox_expand_vm_disks.sh
+  ./proxmox_expand_vm_disks.sh --no-detach
   ./proxmox_expand_vm_disks.sh --dry-run
   ./proxmox_expand_vm_disks.sh --parallel 2 --windows-exec-timeout 1800
   ./proxmox_expand_vm_disks.sh --size +20G
@@ -764,6 +768,36 @@ vmid_allowed() {
   [[ ",${vm_filter}," == *",${vmid},"* ]]
 }
 
+launch_detached_and_exit() {
+  local args=("$@")
+  local run_dir script_path log_path pid
+
+  command -v nohup >/dev/null 2>&1 || die "nohup command not found; cannot detach"
+
+  run_dir="/tmp/proxmox-expand-vm-disks.detached.$(date +%Y%m%d-%H%M%S).$$"
+  script_path="$run_dir/proxmox_expand_vm_disks.sh"
+  log_path="$run_dir/run.log"
+  mkdir -p "$run_dir"
+
+  if [[ -r "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/* ]]; then
+    cat "${BASH_SOURCE[0]}" > "$script_path"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$script_source_url" -o "$script_path"
+  else
+    die "unable to copy current script for detached run and curl is not available"
+  fi
+  chmod +x "$script_path"
+
+  nohup bash "$script_path" "${args[@]}" --no-detach > "$log_path" 2>&1 < /dev/null &
+  pid="$!"
+
+  printf 'Detached run started. SSH can be closed now.\n'
+  printf 'PID: %s\n' "$pid"
+  printf 'Log: %s\n' "$log_path"
+  printf 'Watch live:\n  tail -f %q\n' "$log_path"
+  printf 'Check process:\n  ps -p %s -o pid,etime,cmd\n' "$pid"
+  exit 0
+}
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -787,6 +821,14 @@ parse_args() {
         ;;
       --skip-space-check)
         skip_space_check=1
+        shift
+        ;;
+      --detach)
+        detach=1
+        shift
+        ;;
+      --no-detach|--foreground)
+        detach=0
         shift
         ;;
       --no-watchdog-disable)
@@ -1070,6 +1112,9 @@ print_result_summary() {
 
 main() {
   parse_args "$@"
+  if [[ "$apply" -eq 1 && "$detach" -eq 1 ]]; then
+    launch_detached_and_exit "$@"
+  fi
 
   local vmids=()
   local config name disk vmid

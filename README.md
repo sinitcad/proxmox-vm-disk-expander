@@ -6,7 +6,7 @@ Run it directly on a Proxmox host as `root`.
 
 ## Quick Start
 
-Run on the Proxmox host:
+Safe run on the Proxmox host. Apply mode detaches by default and survives closing SSH:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh)
@@ -19,6 +19,36 @@ This uses the defaults:
 - Windows disk/`C:` OK threshold: `118 GiB`;
 - Windows command timeout: `900` seconds;
 - no fixed `+15G`; each VM gets only the missing amount needed to reach the target.
+
+## Detached Runs
+
+If the script is running in the foreground and the SSH session is closed, the job can be interrupted. Apply mode detaches by default, so the normal production command is safe.
+
+Detached mode:
+
+- copies the current script to `/tmp/proxmox-expand-vm-disks.detached.*`;
+- starts it through `nohup` in the background;
+- redirects output to a log file;
+- prints the PID, log path, `tail -f` command, and `ps` command;
+- starts the child process with `--no-detach` so it does not recursively detach.
+
+Use foreground mode only when you explicitly want live output in the current SSH session:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh) --no-detach
+```
+
+Example output:
+
+```text
+Detached run started. SSH can be closed now.
+PID: 12345
+Log: /tmp/proxmox-expand-vm-disks.detached.20260709-180000.111/run.log
+Watch live:
+  tail -f /tmp/proxmox-expand-vm-disks.detached.20260709-180000.111/run.log
+Check process:
+  ps -p 12345 -o pid,etime,cmd
+```
 
 ## What It Does
 
@@ -58,10 +88,16 @@ Default success thresholds are:
 
 Run latest script directly from GitHub with `curl`. `chmod` is not needed when running through `bash`.
 
-Production run for all VMs on a host:
+Safe production run for all VMs on a host, detached from SSH by default:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh)
+```
+
+Foreground run with live output in the current SSH session:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh) --no-detach
 ```
 
 Use this when the host is overloaded or the Windows guest agents are slow:
