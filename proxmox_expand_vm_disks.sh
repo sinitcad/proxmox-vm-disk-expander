@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-increment="+15G"
+increment=""
 apply=1
 include_templates=0
 vm_filter=""
@@ -11,36 +11,54 @@ stop_timeout=300
 start_timeout=300
 guest_retry_attempts=4
 guest_retry_delay=120
+max_parallel=4
+windows_exec_timeout=900
 expand_windows_c=1
 reserve_tail_gb=1
+pve_ok_gb=119
+windows_ok_gb=118
 log_dir=""
 watchdog_restore_command=""
+watchdog_restore_script=""
+watchdog_restored=0
+interrupted=0
+current_step="init"
+script_source_url="https://raw.githubusercontent.com/sinitcad/proxmox-vm-disk-expander/main/proxmox_expand_vm_disks.sh"
 
 usage() {
   cat <<'EOF'
 Usage:
-  proxmox_expand_vm_disks.sh [--dry-run] [--size +15G] [--include-templates] [--vmid 100,101]
+  proxmox_expand_vm_disks.sh [--dry-run] [--include-templates] [--vmid 100,101]
                               [--only-vmid 101]
                               [--no-windows-c] [--reserve-tail-gb 1] [--skip-space-check]
+                              [--parallel 4] [--windows-exec-timeout 900]
+                              [--pve-ok-gb 119] [--windows-ok-gb 118]
+                              [--size +15G]
                               [--no-watchdog-disable]
 
 Expands one main QEMU disk per VM on the current Proxmox host.
 
 Default mode is apply. Use --dry-run to preview without changes.
 
-Apply mode runs VMs in parallel:
+Apply mode runs VMs in bounded parallel batches:
   - Build a full plan for selected VMs before changing anything
-  - Check free space on each Proxmox storage used by selected VM disks
-  - Auto-detect and disable watchdog cron/processes, leaving watchdog disabled
+  - Read current Proxmox disk size from qm config
+  - Check free space only for disks below --pve-ok-gb
+  - For lvmthin storages that need resize, also check physical thin-pool free space
+  - Auto-detect and disable watchdog cron/processes
+  - Leave watchdog disabled after full success, auto-restore on failure/interrupt
   - Detect VM state
-  - If running, qm stop and wait until the VM is really stopped
-  - qm resize selected disk by the requested increment
-  - If it was running before, qm start and wait until it is running again
-  - Expand C: inside Windows via QEMU guest agent and then start Steam if it is
-    not already running
+  - If the Proxmox disk is already >= --pve-ok-gb, skip qm resize and only
+    verify/repair Windows and Steam
+  - If the Proxmox disk is below --pve-ok-gb, stop if needed and resize by
+    the automatically calculated amount needed to reach --pve-ok-gb
+  - If Windows work is enabled, start the VM, wait for guest agent, and first
+    run a read-only Windows/Steam check
+  - If Windows disk/C: is below --windows-ok-gb or Steam is not running,
+    repair C: and Steam, then verify again
 
-VMs that were already stopped are resized while stopped and then started so the
-Windows partition can be expanded through guest agent and Steam can be started.
+VMs that were already stopped are started when Windows verification/repair is
+enabled, because QEMU Guest Agent is needed for the Windows-side work.
 
 Disk selection:
   1. First boot disk from "boot: order=..." if it is a real disk
@@ -58,10 +76,12 @@ Windows C: expansion, enabled by default:
     before each attempt
   - Re-running is safe: after each disk growth it normalizes the tail reserve,
     so a 1 GiB reserve stays 1 GiB instead of accumulating every run
+  - Job logs are streamed live to stdout and saved under /tmp
 
 Examples:
   ./proxmox_expand_vm_disks.sh
   ./proxmox_expand_vm_disks.sh --dry-run
+  ./proxmox_expand_vm_disks.sh --parallel 2 --windows-exec-timeout 1800
   ./proxmox_expand_vm_disks.sh --size +20G
   ./proxmox_expand_vm_disks.sh --only-vmid 101
   ./proxmox_expand_vm_disks.sh --vmid 101
@@ -104,7 +124,7 @@ wait_for_guest_agent_after_start() {
   for (( attempt = 1; attempt <= attempts; attempt++ )); do
     log "VM vmid=${vmid}: sleeping ${delay}s before guest agent attempt ${attempt}/${attempts}"
     sleep "$delay"
-    if qm guest exec "$vmid" -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Write-Output ready" >/dev/null 2>&1; then
+    if timeout 75s qm guest exec "$vmid" --synchronous 1 --timeout 60 -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Write-Output ready" >/dev/null 2>&1; then
       log "VM vmid=${vmid}: guest agent is ready on attempt ${attempt}/${attempts}"
       return 0
     fi
@@ -115,8 +135,49 @@ wait_for_guest_agent_after_start() {
   return 1
 }
 
+guest_agent_ready_now() {
+  local vmid="$1"
+  timeout 75s qm guest exec "$vmid" --synchronous 1 --timeout 60 -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Write-Output ready" >/dev/null 2>&1
+}
+
+stop_start_vm_for_guest_agent() {
+  local vmid="$1"
+
+  set_step "guest-agent-stop-start"
+  log "VM vmid=${vmid}: guest agent is not usable; doing stop/start"
+  qm stop "$vmid"
+  wait_for_status "$vmid" "stopped" "$stop_timeout"
+  qm start "$vmid"
+  wait_for_status "$vmid" "running" "$start_timeout"
+  wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
+}
+
+ensure_guest_agent_ready() {
+  local vmid="$1"
+  local allow_stop_start="${2:-1}"
+
+  set_step "guest-agent"
+  log "VM vmid=${vmid}: checking Windows guest agent"
+  if guest_agent_ready_now "$vmid"; then
+    log "VM vmid=${vmid}: guest agent is ready"
+    return 0
+  fi
+
+  if [[ "$allow_stop_start" -eq 1 ]]; then
+    stop_start_vm_for_guest_agent "$vmid"
+    return 0
+  fi
+
+  wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
+}
+
 log() {
   printf '%s\n' "$*"
+}
+
+set_step() {
+  current_step="$1"
+  log "STEP: ${current_step}"
 }
 
 die() {
@@ -131,7 +192,48 @@ print_watchdog_restore_command() {
   fi
 }
 
-trap print_watchdog_restore_command EXIT
+restore_watchdog_if_needed() {
+  if [[ -z "$watchdog_restore_script" || "$watchdog_restored" -eq 1 ]]; then
+    return 0
+  fi
+
+  log "Watchdog auto-restore: running ${watchdog_restore_script}"
+  if bash "$watchdog_restore_script"; then
+    watchdog_restored=1
+    log "Watchdog auto-restore: completed"
+    return 0
+  fi
+
+  log "Watchdog auto-restore: failed; run manually: bash ${watchdog_restore_script}"
+  return 1
+}
+
+on_exit() {
+  local rc="$?"
+  if [[ -n "$watchdog_restore_command" ]]; then
+    if (( rc != 0 || interrupted == 1 )); then
+      restore_watchdog_if_needed || true
+    else
+      print_watchdog_restore_command
+    fi
+  fi
+}
+
+on_signal() {
+  local job_pids=()
+
+  interrupted=1
+  log "Interrupted; stopping outstanding work and restoring watchdog if possible"
+  trap - INT TERM
+  mapfile -t job_pids < <(jobs -pr)
+  if [[ "${#job_pids[@]}" -gt 0 ]]; then
+    kill "${job_pids[@]}" 2>/dev/null || true
+  fi
+  exit 130
+}
+
+trap on_exit EXIT
+trap on_signal INT TERM
 
 is_watchdog_cron_line() {
   local line="$1"
@@ -244,17 +346,18 @@ EOS
   ln -sfn "$run_dir" "$base_dir/latest"
 
   watchdog_restore_command="bash $run_dir/enable_watchdog.sh"
+  watchdog_restore_script="$run_dir/enable_watchdog.sh"
   log "Watchdog auto-disable: disabled and left disabled"
-  log "Watchdog auto-disable: restore command will be printed at exit"
+  log "Watchdog auto-disable: restore command will be printed on success; auto-restore will be attempted on failure or interrupt"
 }
 
 increment_to_kib() {
   local size="$1"
   local value unit
 
-  [[ "$size" =~ ^\+([0-9]+)([KMGTP]?)$ ]] || return 1
+  [[ "$size" =~ ^\+([0-9]+)([KMGTPkmgpt]?)$ ]] || return 1
   value="${BASH_REMATCH[1]}"
-  unit="${BASH_REMATCH[2]}"
+  unit="${BASH_REMATCH[2]^^}"
 
   case "$unit" in
     K) printf '%s\n' "$value" ;;
@@ -264,6 +367,29 @@ increment_to_kib() {
     P) printf '%s\n' $((value * 1024 * 1024 * 1024 * 1024)) ;;
     *) return 1 ;;
   esac
+}
+
+resize_mib_to_target() {
+  local current_gb="$1"
+  local target_gb="$2"
+
+  awk -v current="$current_gb" -v target="$target_gb" '
+    BEGIN {
+      diff = target - current
+      if (diff <= 0) {
+        print 0
+        exit
+      }
+      mib = diff * 1024
+      rounded = int(mib)
+      if (mib > rounded) {
+        rounded += 1
+      }
+      if (rounded < 1) {
+        rounded = 1
+      }
+      print rounded
+    }'
 }
 
 kib_to_gib() {
@@ -284,20 +410,83 @@ disk_storage_from_config() {
   printf '%s\n' "${volid%%:*}"
 }
 
+size_to_gib() {
+  local size="$1"
+  local value unit
+
+  [[ "$size" =~ ^([0-9]+([.][0-9]+)?)([KMGTPkmgpt]?)$ ]] || return 1
+  value="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[3]^^}"
+
+  case "$unit" in
+    K) awk -v v="$value" 'BEGIN { printf "%.4f\n", v / 1024 / 1024 }' ;;
+    M) awk -v v="$value" 'BEGIN { printf "%.4f\n", v / 1024 }' ;;
+    ""|G) awk -v v="$value" 'BEGIN { printf "%.4f\n", v }' ;;
+    T) awk -v v="$value" 'BEGIN { printf "%.4f\n", v * 1024 }' ;;
+    P) awk -v v="$value" 'BEGIN { printf "%.4f\n", v * 1024 * 1024 }' ;;
+    *) return 1 ;;
+  esac
+}
+
+float_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+float_lt() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'
+}
+
+disk_size_gib_from_config() {
+  local config="$1"
+  local disk="$2"
+  local line value size_token raw_size
+
+  line="$(printf '%s\n' "$config" | grep -E "^${disk}: " || true)"
+  [[ -n "$line" ]] || return 1
+  value="${line#*: }"
+  size_token="$(printf '%s\n' "$value" | grep -Eio '(^|,)size=[0-9.]+[KMGTP]?' | tail -n 1 || true)"
+  [[ -n "$size_token" ]] || return 1
+  raw_size="${size_token##*size=}"
+  size_to_gib "$raw_size"
+}
+
 storage_available_kib() {
   local storage="$1"
   pvesm status --storage "$storage" 2>/dev/null | awk 'NR == 2 {print $6; exit}'
 }
 
+thin_pool_free_kib() {
+  local storage="$1"
+  local cfg type vg thinpool data_percent lv_size_kib
+
+  cfg="$(pvesm config "$storage" 2>/dev/null || true)"
+  type="$(printf '%s\n' "$cfg" | awk -F': ' 'NR == 1 {print $1; exit}')"
+  [[ "$type" == "lvmthin" ]] || return 1
+
+  vg="$(printf '%s\n' "$cfg" | awk '/^[[:space:]]+vgname[[:space:]]+/ {print $2; exit}')"
+  thinpool="$(printf '%s\n' "$cfg" | awk '/^[[:space:]]+thinpool[[:space:]]+/ {print $2; exit}')"
+  [[ -n "$vg" && -n "$thinpool" ]] || return 2
+  command -v lvs >/dev/null 2>&1 || return 2
+
+  read -r data_percent lv_size_kib < <(
+    lvs --noheadings --units k --nosuffix -o data_percent,lv_size "$vg/$thinpool" 2>/dev/null |
+      awk '{gsub(",", ".", $1); printf "%s %s\n", $1, int($2)}'
+  )
+  [[ -n "${data_percent:-}" && -n "${lv_size_kib:-}" ]] || return 2
+
+  awk -v size="$lv_size_kib" -v used="$data_percent" 'BEGIN { printf "%d\n", size * (100 - used) / 100 }'
+}
+
 precheck_storage_space() {
   local -n storages_ref="$1"
-  local increment_kib="$2"
+  local -n required_ref="$2"
   local -A required_by_storage=()
-  local storage avail_kib required_kib ok=1
+  local idx storage avail_kib required_kib thin_free_kib thin_rc ok=1
 
-  for storage in "${storages_ref[@]}"; do
+  for idx in "${!storages_ref[@]}"; do
+    storage="${storages_ref[$idx]}"
     [[ -n "$storage" ]] || continue
-    required_by_storage["$storage"]=$(( ${required_by_storage["$storage"]:-0} + increment_kib ))
+    required_by_storage["$storage"]=$(( ${required_by_storage["$storage"]:-0} + ${required_ref[$idx]} ))
   done
 
   log "Storage precheck:"
@@ -315,18 +504,105 @@ precheck_storage_space() {
       log "  storage=${storage}: not enough free space"
       ok=0
     fi
+
+    set +e
+    thin_free_kib="$(thin_pool_free_kib "$storage")"
+    thin_rc="$?"
+    set -e
+    if [[ "$thin_rc" -eq 0 ]]; then
+      log "  storage=${storage}: lvmthin physical_free=$(kib_to_gib "$thin_free_kib")G"
+      if (( thin_free_kib < required_kib )); then
+        log "  storage=${storage}: not enough physical thin-pool free space"
+        ok=0
+      fi
+    elif [[ "$thin_rc" -eq 2 ]]; then
+      log "  storage=${storage}: lvmthin physical free check failed"
+      ok=0
+    fi
   done
 
   [[ "$ok" -eq 1 ]] || return 1
 }
 
-expand_windows_c_partition() {
+qm_guest_exec_sync_checked() {
+  local vmid="$1"
+  local command_timeout="$2"
+  local output rc
+  shift 2
+
+  set +e
+  output="$(timeout "$((command_timeout + 60))s" qm guest exec "$vmid" --synchronous 1 --timeout "$command_timeout" -- "$@" 2>&1)"
+  rc="$?"
+  set -e
+
+  printf '%s\n' "$output"
+
+  if (( rc != 0 )); then
+    log "VM vmid=${vmid}: qm guest exec failed with rc=${rc}"
+    return "$rc"
+  fi
+
+  if printf '%s\n' "$output" | grep -Eq '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+    return 0
+  fi
+
+  if printf '%s\n' "$output" | grep -Eq '"exitcode"[[:space:]]*:'; then
+    log "VM vmid=${vmid}: guest command completed with non-zero exitcode"
+    return 2
+  fi
+
+  log "VM vmid=${vmid}: guest command output did not contain an exitcode; treating as failure"
+  return 1
+}
+
+windows_state_check() {
+  local vmid="$1"
+  local ps
+
+  ps='
+$ErrorActionPreference = "Stop"
+$minGb = [double]'"$windows_ok_gb"'
+Update-HostStorageCache | Out-Null
+
+$c = Get-Partition -DriveLetter C
+$disk = Get-Disk -Number $c.DiskNumber
+$vol = Get-Volume -DriveLetter C
+$proc = Get-Process -Name steam -ErrorAction SilentlyContinue | Select-Object -First 1 Id,ProcessName,Path
+
+$diskGb = [math]::Round($disk.Size/1GB,4)
+$cGb = [math]::Round($c.Size/1GB,4)
+$diskOk = ($disk.Size -ge ([int64]($minGb * 1GB)))
+$cOk = ($c.Size -ge ([int64]($minGb * 1GB)))
+$steamOk = [bool]$proc
+$success = $diskOk -and $cOk -and $steamOk
+
+[pscustomobject]@{
+  Success = $success
+  Mode = "check-only"
+  MinWindowsGB = $minGb
+  DiskGB = $diskGb
+  CGB = $cGb
+  FreeGB = [math]::Round($vol.SizeRemaining/1GB,4)
+  DiskOk = $diskOk
+  COk = $cOk
+  Steam = $steamOk
+  SteamProcess = $proc
+} | ConvertTo-Json -Compress -Depth 4
+
+if (-not $success) { exit 2 }
+'
+
+  qm_guest_exec_sync_checked "$vmid" "$windows_exec_timeout" powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ps"
+}
+
+windows_resize_verify_and_steam() {
   local vmid="$1"
   local ps
 
   ps='
 $ErrorActionPreference = "Stop"
 $reserveBytes = [int64]([double]'"$reserve_tail_gb"' * 1GB)
+$tailToleranceBytes = [int64](512MB)
 Update-HostStorageCache | Out-Null
 
 $c = Get-Partition -DriveLetter C
@@ -365,33 +641,8 @@ Update-HostStorageCache | Out-Null
 $afterC = Get-Partition -DriveLetter C
 $disk = Get-Disk -Number $diskNumber
 $tailFree = $disk.Size - ($afterC.Offset + $afterC.Size)
-$afterSupported = Get-PartitionSupportedSize -DriveLetter C
-[pscustomobject]@{
-  ReserveRequestedGB = [math]::Round($reserveBytes/1GB,4)
-  RemovedTrailingRecovery = $removed
-  BeforeCSizeGB = [math]::Round($beforeC.Size/1GB,4)
-  SupportedMaxGB = [math]::Round($supported.SizeMax/1GB,4)
-  TargetCSizeGB = [math]::Round($target/1GB,4)
-  Action = $action
-  TailFreeGB = [math]::Round($tailFree/1GB,4)
-  After = [pscustomobject]@{
-    Disk = $disk | Select-Object Number,FriendlyName,PartitionStyle,@{Name="SizeGB";Expression={[math]::Round($_.Size/1GB,4)}}
-    Partitions = Get-Partition -DiskNumber $diskNumber | Sort-Object PartitionNumber | Select-Object DiskNumber,PartitionNumber,DriveLetter,Type,@{Name="OffsetGB";Expression={[math]::Round($_.Offset/1GB,4)}},@{Name="SizeGB";Expression={[math]::Round($_.Size/1GB,4)}}
-    CSupportedMaxGB = [math]::Round($afterSupported.SizeMax/1GB,4)
-    CVolume = Get-Volume -DriveLetter C | Select-Object DriveLetter,FileSystem,@{Name="SizeGB";Expression={[math]::Round($_.Size/1GB,4)}},@{Name="FreeGB";Expression={[math]::Round($_.SizeRemaining/1GB,4)}}
-  }
-} | ConvertTo-Json -Compress -Depth 6
-'
+$vol = Get-Volume -DriveLetter C
 
-  qm guest exec "$vmid" -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ps"
-}
-
-start_steam_in_windows() {
-  local vmid="$1"
-  local ps
-
-  ps='
-$ErrorActionPreference = "Stop"
 $proc = Get-Process -Name steam -ErrorAction SilentlyContinue | Select-Object -First 1 Id,ProcessName,Path
 $paths = @(
   "C:\Program Files (x86)\Steam\steam.exe",
@@ -406,25 +657,44 @@ if (-not $steamExe) {
     if (Test-Path $candidate) { $steamExe = $candidate }
   }
 }
-$action = "already-running"
+$steamAction = "already-running"
 if (-not $proc) {
   if ($steamExe) {
     Start-Process -FilePath $steamExe -ArgumentList "-silent" -WorkingDirectory (Split-Path $steamExe)
-    Start-Sleep -Seconds 8
+    Start-Sleep -Seconds 10
     $proc = Get-Process -Name steam -ErrorAction SilentlyContinue | Select-Object -First 1 Id,ProcessName,Path
-    if ($proc) { $action = "started" } else { $action = "start-command-sent-but-not-detected" }
+    if ($proc) { $steamAction = "started" } else { $steamAction = "start-command-sent-but-not-detected" }
   } else {
-    $action = "steam-exe-not-found"
+    $steamAction = "steam-exe-not-found"
   }
 }
-[pscustomobject]@{
+
+$tailOk = ([math]::Abs([double]($tailFree - $reserveBytes)) -le $tailToleranceBytes)
+$cOk = ($afterC.Size -ge ($target - 100MB))
+$steamOk = [bool]$proc
+$success = $tailOk -and $cOk -and $steamOk
+$result = [pscustomobject]@{
+  Success = $success
   Action = $action
+  DiskGB = [math]::Round($disk.Size/1GB,4)
+  BeforeCGB = [math]::Round($beforeC.Size/1GB,4)
+  CGB = [math]::Round($afterC.Size/1GB,4)
+  TargetCGB = [math]::Round($target/1GB,4)
+  TailGB = [math]::Round($tailFree/1GB,4)
+  ReserveGB = [math]::Round($reserveBytes/1GB,4)
+  FreeGB = [math]::Round($vol.SizeRemaining/1GB,4)
+  TailOk = $tailOk
+  COk = $cOk
+  Steam = $steamOk
+  SteamAction = $steamAction
   SteamExe = $steamExe
-  Process = $proc
-} | ConvertTo-Json -Compress -Depth 4
+  RemovedTrailingRecovery = $removed
+}
+$result | ConvertTo-Json -Compress -Depth 5
+if (-not $success) { exit 2 }
 '
 
-  qm guest exec "$vmid" -- powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ps"
+  qm_guest_exec_sync_checked "$vmid" "$windows_exec_timeout" powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ps"
 }
 
 is_real_disk_line() {
@@ -543,6 +813,26 @@ parse_args() {
         guest_retry_delay="$2"
         shift 2
         ;;
+      --parallel)
+        [[ $# -ge 2 ]] || die "--parallel requires a number"
+        max_parallel="$2"
+        shift 2
+        ;;
+      --windows-exec-timeout)
+        [[ $# -ge 2 ]] || die "--windows-exec-timeout requires seconds"
+        windows_exec_timeout="$2"
+        shift 2
+        ;;
+      --pve-ok-gb)
+        [[ $# -ge 2 ]] || die "--pve-ok-gb requires gigabytes"
+        pve_ok_gb="$2"
+        shift 2
+        ;;
+      --windows-ok-gb)
+        [[ $# -ge 2 ]] || die "--windows-ok-gb requires gigabytes"
+        windows_ok_gb="$2"
+        shift 2
+        ;;
       --expand-windows-c)
         expand_windows_c=1
         shift
@@ -566,12 +856,18 @@ parse_args() {
     esac
   done
 
-  [[ "$increment" =~ ^\+[0-9]+[KMGTP]?$ ]] || die "--size must look like +15G"
+  [[ -z "$increment" || "$increment" =~ ^\+[0-9]+[KMGTPkmgpt]?$ ]] || die "--size must look like +15G"
   [[ "$stop_timeout" =~ ^[0-9]+$ ]] || die "--stop-timeout must be seconds"
   [[ "$start_timeout" =~ ^[0-9]+$ ]] || die "--start-timeout must be seconds"
   [[ "$guest_retry_attempts" =~ ^[0-9]+$ ]] || die "--guest-retry-attempts must be a count"
   [[ "$guest_retry_delay" =~ ^[0-9]+$ ]] || die "--guest-retry-delay must be seconds"
+  [[ "$max_parallel" =~ ^[0-9]+$ ]] || die "--parallel must be a number"
+  [[ "$windows_exec_timeout" =~ ^[0-9]+$ ]] || die "--windows-exec-timeout must be seconds"
+  [[ "$pve_ok_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--pve-ok-gb must be numeric"
+  [[ "$windows_ok_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--windows-ok-gb must be numeric"
   [[ "$guest_retry_attempts" -ge 1 ]] || die "--guest-retry-attempts must be at least 1"
+  [[ "$max_parallel" -ge 1 ]] || die "--parallel must be at least 1"
+  [[ "$windows_exec_timeout" -ge 60 ]] || die "--windows-exec-timeout must be at least 60"
   [[ "$reserve_tail_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--reserve-tail-gb must be numeric"
 }
 
@@ -579,51 +875,197 @@ process_vm() {
   local vmid="$1"
   local name="$2"
   local disk="$3"
+  local pve_disk_gb="$4"
+  local resize_increment="$5"
   local initial_status=""
   local start_after_resize=0
+  local started_now=0
+  local did_pve_resize=0
+  local check_rc=0
 
   initial_status="$(vm_status "$vmid" || true)"
   [[ -n "$initial_status" ]] || initial_status="unknown"
 
   if [[ "$apply" -eq 0 ]]; then
-    log "VM vmid=${vmid} name=${name}: would resize ${disk} by ${increment}; current_status=${initial_status}; apply_plan=stop-if-running,resize$(if [[ "$expand_windows_c" -eq 1 ]]; then printf ',start-after-resize,guest-agent-4x-after-2min,expand-windows-c-leave-%sGiB-tail,start-steam' "$reserve_tail_gb"; else printf ',start-if-was-running'; fi)"
+    if float_ge "$pve_disk_gb" "$pve_ok_gb"; then
+      log "VM vmid=${vmid} name=${name}: dry-run pve=${pve_disk_gb}G >= ${pve_ok_gb}G, PVE resize not needed; Windows/Steam check would run"
+    else
+      log "VM vmid=${vmid} name=${name}: dry-run pve=${pve_disk_gb}G < ${pve_ok_gb}G, would stop-if-running, resize ${disk} by ${resize_increment}, start, then verify/repair Windows and Steam"
+    fi
     return 0
   fi
 
-  log "VM vmid=${vmid} name=${name}: status=${initial_status}, disk=${disk}, increment=${increment}"
+  log "VM vmid=${vmid} name=${name}: status=${initial_status}, disk=${disk}, pve_disk=${pve_disk_gb}G, pve_ok_threshold=${pve_ok_gb}G, resize_increment=${resize_increment:-none}"
 
-  if [[ "$initial_status" == "running" ]]; then
-    log "VM vmid=${vmid}: stopping"
-    qm stop "$vmid"
-    wait_for_status "$vmid" "stopped" "$stop_timeout"
-    start_after_resize=1
-  elif [[ "$initial_status" != "stopped" ]]; then
+  if [[ "$initial_status" != "running" && "$initial_status" != "stopped" ]]; then
     die "vmid=${vmid} is in unsupported status '${initial_status}'"
   fi
 
-  if [[ "$expand_windows_c" -eq 1 ]]; then
+  if float_lt "$pve_disk_gb" "$pve_ok_gb"; then
+    [[ -n "$resize_increment" ]] || die "vmid=${vmid}: PVE disk is below ${pve_ok_gb}G but resize increment was not calculated"
+
+    if [[ "$initial_status" == "running" ]]; then
+      set_step "stop"
+      log "VM vmid=${vmid}: PVE disk below threshold, stopping before resize"
+      qm stop "$vmid"
+      wait_for_status "$vmid" "stopped" "$stop_timeout"
+      start_after_resize=1
+    fi
+
+    if [[ "$expand_windows_c" -eq 1 ]]; then
+      start_after_resize=1
+    fi
+
+    set_step "pve-resize"
+    log "VM vmid=${vmid}: resizing ${disk} by ${resize_increment}"
+    qm resize "$vmid" "$disk" "$resize_increment"
+    did_pve_resize=1
+  else
+    log "VM vmid=${vmid}: PVE disk already >= ${pve_ok_gb}G; skipping qm resize"
+  fi
+
+  if [[ "$expand_windows_c" -eq 1 && "$(vm_status "$vmid" || true)" == "stopped" ]]; then
     start_after_resize=1
   fi
 
-  log "VM vmid=${vmid}: resizing ${disk} by ${increment}"
-  qm resize "$vmid" "$disk" "$increment"
-
   if [[ "$start_after_resize" -eq 1 ]]; then
+    set_step "start"
     log "VM vmid=${vmid}: starting"
     qm start "$vmid"
     wait_for_status "$vmid" "running" "$start_timeout"
+    started_now=1
   fi
 
   if [[ "$expand_windows_c" -eq 1 ]]; then
-    log "VM vmid=${vmid}: waiting for Windows guest agent"
-    wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
-    log "VM vmid=${vmid}: expanding Windows C: leaving ${reserve_tail_gb} GiB unallocated tail"
-    expand_windows_c_partition "$vmid"
-    log "VM vmid=${vmid}: starting Steam if needed"
-    start_steam_in_windows "$vmid"
+    if [[ "$started_now" -eq 1 ]]; then
+      set_step "guest-agent"
+      log "VM vmid=${vmid}: VM was just started; waiting for Windows guest agent"
+      wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
+    else
+      ensure_guest_agent_ready "$vmid" 1
+    fi
+
+    set_step "windows-check"
+    log "VM vmid=${vmid}: checking Windows disk >= ${windows_ok_gb}G and Steam running"
+    set +e
+    windows_state_check "$vmid"
+    check_rc="$?"
+    set -e
+
+    if [[ "$check_rc" -eq 0 ]]; then
+      log "VM vmid=${vmid}: Windows disk and Steam already OK"
+    else
+      if [[ "$check_rc" -ne 2 ]]; then
+        log "VM vmid=${vmid}: Windows check could not complete cleanly; doing stop/start before repair"
+        stop_start_vm_for_guest_agent "$vmid"
+      fi
+
+      set_step "windows-repair"
+      log "VM vmid=${vmid}: repairing Windows C:, tail reserve, and Steam"
+      windows_resize_verify_and_steam "$vmid"
+
+      set_step "windows-final-check"
+      log "VM vmid=${vmid}: final Windows disk/Steam verification"
+      windows_state_check "$vmid"
+    fi
+  elif [[ "$did_pve_resize" -eq 0 ]]; then
+    log "VM vmid=${vmid}: no Windows work requested and PVE disk already OK"
   fi
 
+  set_step "success"
   log "VM vmid=${vmid}: done"
+}
+
+run_vm_job() {
+  local vmid="$1"
+  local name="$2"
+  local disk="$3"
+  local pve_disk_gb="$4"
+  local resize_increment="$5"
+  local logfile="$6"
+  local statusfile="$7"
+
+  (
+    current_step="init"
+    trap 'rc=$?; trap - EXIT; printf "%s\t%s\t%s\t%s\t%s\n" "$vmid" "$rc" "$current_step" "$name" "$logfile" > "$statusfile"; exit "$rc"' EXIT
+    process_vm "$vmid" "$name" "$disk" "$pve_disk_gb" "$resize_increment"
+  ) 2>&1 | while IFS= read -r line; do
+    printf '%s [vmid=%s name=%s] %s\n' "$(date '+%F %T')" "$vmid" "$name" "$line" | tee -a "$logfile"
+  done
+}
+
+rerun_command_for_vmid() {
+  local vmid="$1"
+  local script_path="${BASH_SOURCE[0]:-$0}"
+  local runner
+  local cmd
+
+  if [[ -f "$script_path" && "$script_path" != /dev/fd/* && "$script_path" != /proc/* ]]; then
+    printf -v runner 'bash %q' "$script_path"
+  else
+    runner="bash <(curl -fsSL ${script_source_url})"
+  fi
+
+  printf -v cmd '%s --only-vmid %q' "$runner" "$vmid"
+
+  if [[ -n "$increment" ]]; then
+    cmd="${cmd} --size ${increment}"
+  fi
+  if [[ "$windows_exec_timeout" != "900" ]]; then
+    cmd="${cmd} --windows-exec-timeout ${windows_exec_timeout}"
+  fi
+  if [[ "$guest_retry_attempts" != "4" ]]; then
+    cmd="${cmd} --guest-retry-attempts ${guest_retry_attempts}"
+  fi
+  if [[ "$guest_retry_delay" != "120" ]]; then
+    cmd="${cmd} --guest-retry-delay ${guest_retry_delay}"
+  fi
+  if [[ "$reserve_tail_gb" != "1" ]]; then
+    cmd="${cmd} --reserve-tail-gb ${reserve_tail_gb}"
+  fi
+  if [[ "$pve_ok_gb" != "119" ]]; then
+    cmd="${cmd} --pve-ok-gb ${pve_ok_gb}"
+  fi
+  if [[ "$windows_ok_gb" != "118" ]]; then
+    cmd="${cmd} --windows-ok-gb ${windows_ok_gb}"
+  fi
+  if [[ "$expand_windows_c" -eq 0 ]]; then
+    cmd="${cmd} --no-windows-c"
+  fi
+  if [[ "$skip_space_check" -eq 1 ]]; then
+    cmd="${cmd} --skip-space-check"
+  fi
+  if [[ "$auto_disable_watchdog" -eq 0 ]]; then
+    cmd="${cmd} --no-watchdog-disable"
+  fi
+
+  printf '%s\n' "$cmd"
+}
+
+print_result_summary() {
+  local failed=0
+  local total=0
+  local ok=0
+  local statusfile vmid rc step name logfile
+
+  log ""
+  log "VM result summary:"
+  for statusfile in "$log_dir"/*.status; do
+    [[ -e "$statusfile" ]] || continue
+    IFS=$'\t' read -r vmid rc step name logfile < "$statusfile"
+    total=$((total + 1))
+    if [[ "$rc" == "0" ]]; then
+      ok=$((ok + 1))
+      log "  OK   vmid=${vmid} name=${name} step=${step} log=${logfile}"
+    else
+      failed=1
+      log "  FAIL vmid=${vmid} name=${name} step=${step} rc=${rc} log=${logfile}"
+      log "       rerun: $(rerun_command_for_vmid "$vmid")"
+    fi
+  done
+  log "Summary: total=${total} ok=${ok} fail=$((total - ok)) logs=${log_dir}"
+
+  [[ "$failed" -eq 0 ]]
 }
 
 main() {
@@ -631,24 +1073,28 @@ main() {
 
   local vmids=()
   local config name disk vmid
-  local storage increment_kib
+  local storage pve_disk_gb resize_mib resize_increment required_kib
   local selected_vmids=()
   local selected_names=()
   local selected_disks=()
-  local selected_storages=()
+  local selected_pve_gbs=()
+  local selected_resize_increments=()
+  local resize_storages=()
+  local resize_required_kibs=()
   local resized=0
   local skipped=0
-  local pids=()
-  local pid failed file
+  local pve_resize_needed=0
+  local failed
+  local running_jobs=0
 
   command -v qm >/dev/null 2>&1 || die "qm command not found; run this on a Proxmox host"
 
   if [[ "$apply" -eq 0 ]]; then
     log "Mode: dry-run. Nothing will be changed."
   else
-    log "Mode: apply. VMs are processed in parallel. Running VMs will be stopped, resized by ${increment}, then started again."
+    log "Mode: apply. VMs are processed with parallel=${max_parallel}. PVE resize is skipped when disk >= ${pve_ok_gb}G; disks below that are auto-expanded exactly up to the target. Windows is OK when disk/C >= ${windows_ok_gb}G and Steam is running."
     if [[ "$expand_windows_c" -eq 1 ]]; then
-      log "Windows C: expansion enabled. Each VM will leave ${reserve_tail_gb} GiB unallocated at the end of the disk, then Steam will be started if needed. Guest agent attempts=${guest_retry_attempts}, delay=${guest_retry_delay}s."
+      log "Windows C: expansion enabled. Each VM will leave ${reserve_tail_gb} GiB unallocated at the end of the disk, then Steam will be started if needed. Guest agent attempts=${guest_retry_attempts}, delay=${guest_retry_delay}s, windows_exec_timeout=${windows_exec_timeout}s."
     fi
   fi
 
@@ -680,18 +1126,42 @@ main() {
       continue
     fi
 
+    if ! pve_disk_gb="$(disk_size_gib_from_config "$config" "$disk")"; then
+      log "SKIP vmid=${vmid} name=${name}: unable to detect current Proxmox size for ${disk}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
     selected_vmids+=("$vmid")
     selected_names+=("$name")
     selected_disks+=("$disk")
-    selected_storages+=("$storage")
+    selected_pve_gbs+=("$pve_disk_gb")
+    resize_increment=""
+    if float_lt "$pve_disk_gb" "$pve_ok_gb"; then
+      if [[ -n "$increment" ]]; then
+        resize_increment="$increment"
+        required_kib="$(increment_to_kib "$increment")" || die "unable to parse increment ${increment}"
+      else
+        resize_mib="$(resize_mib_to_target "$pve_disk_gb" "$pve_ok_gb")"
+        resize_increment="+${resize_mib}M"
+        required_kib=$((resize_mib * 1024))
+      fi
+      selected_resize_increments+=("$resize_increment")
+      resize_storages+=("$storage")
+      resize_required_kibs+=("$required_kib")
+      pve_resize_needed=$((pve_resize_needed + 1))
+    else
+      selected_resize_increments+=("")
+    fi
     resized=$((resized + 1))
   done
 
   [[ "${#selected_vmids[@]}" -gt 0 ]] || die "no selected VMs with resizable disks found"
 
-  increment_kib="$(increment_to_kib "$increment")" || die "unable to parse increment ${increment}"
-  if [[ "$skip_space_check" -eq 0 ]]; then
-    precheck_storage_space selected_storages "$increment_kib" || die "storage precheck failed; not starting VM changes"
+  if [[ "$skip_space_check" -eq 0 && "$pve_resize_needed" -gt 0 ]]; then
+    precheck_storage_space resize_storages resize_required_kibs || die "storage precheck failed; not starting VM changes"
+  elif [[ "$skip_space_check" -eq 0 ]]; then
+    log "Storage precheck: no PVE resize needed; all selected disks are already >= ${pve_ok_gb}G"
   else
     log "Storage precheck skipped by --skip-space-check"
   fi
@@ -706,33 +1176,45 @@ main() {
     vmid="${selected_vmids[$idx]}"
     name="${selected_names[$idx]}"
     disk="${selected_disks[$idx]}"
+    pve_disk_gb="${selected_pve_gbs[$idx]}"
+    resize_increment="${selected_resize_increments[$idx]}"
 
     if [[ "$apply" -eq 1 ]]; then
       mkdir -p "${log_dir}"
-      (
-        process_vm "$vmid" "$name" "$disk"
-      ) >"${log_dir}/${vmid}.log" 2>&1 &
-      pids+=("$!")
+      run_vm_job "$vmid" "$name" "$disk" "$pve_disk_gb" "$resize_increment" "${log_dir}/${vmid}.log" "${log_dir}/${vmid}.status" &
+      running_jobs=$((running_jobs + 1))
+      if (( running_jobs >= max_parallel )); then
+        wait -n || true
+        running_jobs=$((running_jobs - 1))
+      fi
     else
-      process_vm "$vmid" "$name" "$disk"
+      process_vm "$vmid" "$name" "$disk" "$pve_disk_gb" "$resize_increment"
     fi
   done
 
   if [[ "$apply" -eq 1 ]]; then
     failed=0
-    for pid in "${pids[@]}"; do
-      if ! wait "$pid"; then
+    while (( running_jobs > 0 )); do
+      if ! wait -n; then
         failed=1
+      fi
+      running_jobs=$((running_jobs - 1))
+    done
+
+    for idx in "${!selected_vmids[@]}"; do
+      vmid="${selected_vmids[$idx]}"
+      name="${selected_names[$idx]}"
+      if [[ ! -s "${log_dir}/${vmid}.status" ]]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$vmid" "missing" "no-status" "$name" "${log_dir}/${vmid}.log" > "${log_dir}/${vmid}.status"
       fi
     done
 
-    for file in "${log_dir}"/*.log; do
-      [[ -e "$file" ]] || continue
-      cat "$file"
-    done
+    if ! print_result_summary; then
+      failed=1
+    fi
 
     if [[ "$failed" -ne 0 ]]; then
-      die "one or more VM resize jobs failed; logs are in ${log_dir}"
+      die "one or more VM resize jobs failed; see VM result summary above and logs in ${log_dir}"
     fi
   fi
 
