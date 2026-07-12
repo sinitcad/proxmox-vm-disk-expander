@@ -18,6 +18,8 @@ expand_windows_c=1
 reserve_tail_gb=1
 pve_ok_gb=119
 windows_ok_gb=118
+manage_vgpu=1
+shutdown_timeout=300
 log_dir=""
 watchdog_restore_command=""
 watchdog_restore_script=""
@@ -36,6 +38,7 @@ Usage:
                               [--pve-ok-gb 119] [--windows-ok-gb 118]
                               [--size +15G]
                               [--no-detach] [--no-watchdog-disable]
+                              [--no-vgpu-manage] [--shutdown-timeout 300]
 
 Expands one main QEMU disk per VM on the current Proxmox host.
 
@@ -60,6 +63,18 @@ Apply mode runs VMs in bounded parallel batches:
 
 VMs that were already stopped are started when Windows verification/repair is
 enabled, because QEMU Guest Agent is needed for the Windows-side work.
+
+vGPU handling (enabled by default, disable with --no-vgpu-manage):
+  Some Windows VMs with a passed-through vGPU (hostpciN) leave the QEMU guest
+  agent unresponsive after a stop/start until the vGPU is detached and
+  re-attached. To make Windows work reliable, this script, while the VM is
+  stopped, detaches all hostpciN devices, starts the VM WITHOUT the vGPU (the
+  guest agent then responds), performs the Windows/Steam work, then stops the
+  VM again, re-attaches the exact hostpciN lines it saved, and starts the VM
+  with the vGPU restored. The saved hostpci lines are written to
+  <log_dir>/<vmid>.hostpci and auto-restored on failure or interrupt so a VM is
+  never left without its vGPU. Graceful ACPI shutdown is tried first
+  (--shutdown-timeout, default 300s) before any hard stop.
 
 Disk selection:
   1. First boot disk from "boot: order=..." if it is a real disk
@@ -117,6 +132,124 @@ wait_for_status() {
 
   printf 'timeout waiting for vmid=%s status=%s, current=%s\n' "$vmid" "$wanted" "${status:-unknown}" >&2
   return 1
+}
+
+vgpu_state_file() {
+  local vmid="$1"
+  printf '%s/%s.hostpci' "$log_dir" "$vmid"
+}
+
+# Detach all hostpciN (vGPU / passthrough) lines from a STOPPED VM and persist
+# them to disk so they can always be restored, even after a crash or interrupt.
+detach_vgpu_if_present() {
+  local vmid="$1"
+  local config statefile hostpci_lines key value
+
+  [[ "$manage_vgpu" -eq 1 ]] || return 0
+
+  statefile="$(vgpu_state_file "$vmid")"
+
+  # If a state file already exists with content, vGPU was already detached in a
+  # previous step or a prior interrupted run; do not overwrite it.
+  if [[ -s "$statefile" ]]; then
+    log "VM vmid=${vmid}: vGPU state already saved; skipping re-detach"
+    return 0
+  fi
+
+  config="$(qm config "$vmid")"
+  hostpci_lines="$(printf '%s\n' "$config" | grep -E '^hostpci[0-9]+: ' || true)"
+
+  if [[ -z "$hostpci_lines" ]]; then
+    log "VM vmid=${vmid}: no hostpci/vGPU devices in config; nothing to detach"
+    # Write an empty marker so restore is a no-op and we do not re-scan later.
+    : > "$statefile"
+    return 0
+  fi
+
+  mkdir -p "$log_dir"
+  printf '%s\n' "$hostpci_lines" > "$statefile"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    value="${line#*: }"
+    log "VM vmid=${vmid}: detaching ${key} (${value}) before starting without vGPU"
+    qm set "$vmid" "--delete" "$key" >/dev/null
+  done <<< "$hostpci_lines"
+
+  log "VM vmid=${vmid}: vGPU/passthrough detached and saved to ${statefile}"
+}
+
+# Restore previously detached hostpciN lines onto a STOPPED VM.
+# Safe to call multiple times: it clears the state file on success.
+restore_vgpu_if_needed() {
+  local vmid="$1"
+  local statefile key value line
+
+  [[ "$manage_vgpu" -eq 1 ]] || return 0
+
+  statefile="$(vgpu_state_file "$vmid")"
+  [[ -f "$statefile" ]] || return 0
+
+  # Empty marker means there was nothing to restore.
+  if [[ ! -s "$statefile" ]]; then
+    rm -f "$statefile"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    value="${line#*: }"
+    log "VM vmid=${vmid}: restoring ${key} (${value})"
+    qm set "$vmid" "--${key}" "$value" >/dev/null
+  done < "$statefile"
+
+  rm -f "$statefile"
+  log "VM vmid=${vmid}: vGPU/passthrough restored"
+}
+
+# Failure/interrupt path: ensure the VM gets its vGPU back so it is never left
+# unusable for the end user. Called from the per-VM EXIT trap on non-zero rc.
+restore_vgpu_on_failure() {
+  local vmid="$1"
+  local statefile
+
+  [[ "$manage_vgpu" -eq 1 ]] || return 0
+  statefile="$(vgpu_state_file "$vmid")"
+  [[ -s "$statefile" ]] || return 0
+
+  log "VM vmid=${vmid}: failure/interrupt detected; restoring vGPU before exit"
+  # Restoring hostpci requires a stopped VM. Force-stop is acceptable here
+  # because the final boot with vGPU re-initializes the guest agent cleanly.
+  if [[ "$(vm_status "$vmid" || true)" != "stopped" ]]; then
+    qm stop "$vmid" >/dev/null 2>&1 || true
+    wait_for_status "$vmid" "stopped" "$stop_timeout" || true
+  fi
+  restore_vgpu_if_needed "$vmid" || log "VM vmid=${vmid}: WARNING: vGPU restore failed; restore manually from ${statefile}"
+  # Try to bring the VM back up for the user.
+  qm start "$vmid" >/dev/null 2>&1 || true
+}
+
+# Bring a VM to 'stopped' as gently as possible: try ACPI shutdown first,
+# fall back to hard stop only if it does not power off in time.
+graceful_stop_vm() {
+  local vmid="$1"
+  local status
+
+  status="$(vm_status "$vmid" || true)"
+  [[ "$status" == "stopped" ]] && return 0
+
+  log "VM vmid=${vmid}: attempting graceful shutdown (timeout ${shutdown_timeout}s)"
+  if qm shutdown "$vmid" --timeout "$shutdown_timeout" >/dev/null 2>&1 \
+      && wait_for_status "$vmid" "stopped" "$shutdown_timeout"; then
+    log "VM vmid=${vmid}: shut down gracefully"
+    return 0
+  fi
+
+  log "VM vmid=${vmid}: graceful shutdown did not complete; forcing stop"
+  qm stop "$vmid"
+  wait_for_status "$vmid" "stopped" "$stop_timeout"
 }
 
 wait_for_guest_agent_after_start() {
@@ -835,6 +968,15 @@ parse_args() {
         auto_disable_watchdog=0
         shift
         ;;
+      --no-vgpu-manage)
+        manage_vgpu=0
+        shift
+        ;;
+      --shutdown-timeout)
+        [[ $# -ge 2 ]] || die "--shutdown-timeout requires seconds"
+        shutdown_timeout="$2"
+        shift 2
+        ;;
       --stop-timeout)
         [[ $# -ge 2 ]] || die "--stop-timeout requires seconds"
         stop_timeout="$2"
@@ -901,6 +1043,7 @@ parse_args() {
   [[ -z "$increment" || "$increment" =~ ^\+[0-9]+[KMGTPkmgpt]?$ ]] || die "--size must look like +15G"
   [[ "$stop_timeout" =~ ^[0-9]+$ ]] || die "--stop-timeout must be seconds"
   [[ "$start_timeout" =~ ^[0-9]+$ ]] || die "--start-timeout must be seconds"
+  [[ "$shutdown_timeout" =~ ^[0-9]+$ ]] || die "--shutdown-timeout must be seconds"
   [[ "$guest_retry_attempts" =~ ^[0-9]+$ ]] || die "--guest-retry-attempts must be a count"
   [[ "$guest_retry_delay" =~ ^[0-9]+$ ]] || die "--guest-retry-delay must be seconds"
   [[ "$max_parallel" =~ ^[0-9]+$ ]] || die "--parallel must be a number"
@@ -920,7 +1063,6 @@ process_vm() {
   local pve_disk_gb="$4"
   local resize_increment="$5"
   local initial_status=""
-  local start_after_resize=0
   local started_now=0
   local did_pve_resize=0
   local check_rc=0
@@ -943,21 +1085,32 @@ process_vm() {
     die "vmid=${vmid} is in unsupported status '${initial_status}'"
   fi
 
-  if float_lt "$pve_disk_gb" "$pve_ok_gb"; then
+  # Whether this VM needs the guest agent for Windows work. If so, we run the
+  # VM WITHOUT its vGPU so the QEMU guest agent responds reliably, then restore
+  # the vGPU at the very end.
+  local needs_windows_work="$expand_windows_c"
+  local needs_pve_resize=0
+  float_lt "$pve_disk_gb" "$pve_ok_gb" && needs_pve_resize=1
+
+  # If neither a resize nor Windows work is needed, there is nothing to do and
+  # no reason to touch the VM state or the vGPU.
+  if [[ "$needs_pve_resize" -eq 0 && "$needs_windows_work" -eq 0 ]]; then
+    log "VM vmid=${vmid}: no Windows work requested and PVE disk already OK"
+    set_step "success"
+    log "VM vmid=${vmid}: done"
+    return 0
+  fi
+
+  # Any work below requires the VM to pass through a stopped state, both to
+  # resize (safer stopped) and to detach the vGPU. Stop gracefully if running.
+  if [[ "$(vm_status "$vmid" || true)" == "running" ]]; then
+    set_step "stop"
+    log "VM vmid=${vmid}: stopping (gracefully) before resize/vGPU detach"
+    graceful_stop_vm "$vmid"
+  fi
+
+  if [[ "$needs_pve_resize" -eq 1 ]]; then
     [[ -n "$resize_increment" ]] || die "vmid=${vmid}: PVE disk is below ${pve_ok_gb}G but resize increment was not calculated"
-
-    if [[ "$initial_status" == "running" ]]; then
-      set_step "stop"
-      log "VM vmid=${vmid}: PVE disk below threshold, stopping before resize"
-      qm stop "$vmid"
-      wait_for_status "$vmid" "stopped" "$stop_timeout"
-      start_after_resize=1
-    fi
-
-    if [[ "$expand_windows_c" -eq 1 ]]; then
-      start_after_resize=1
-    fi
-
     set_step "pve-resize"
     log "VM vmid=${vmid}: resizing ${disk} by ${resize_increment}"
     qm resize "$vmid" "$disk" "$resize_increment"
@@ -966,53 +1119,71 @@ process_vm() {
     log "VM vmid=${vmid}: PVE disk already >= ${pve_ok_gb}G; skipping qm resize"
   fi
 
-  if [[ "$expand_windows_c" -eq 1 && "$(vm_status "$vmid" || true)" == "stopped" ]]; then
-    start_after_resize=1
+  # If no Windows work is needed, we do not need to start the VM at all beyond
+  # the resize. Leave it in the state we found it in and finish.
+  if [[ "$needs_windows_work" -eq 0 ]]; then
+    if [[ "$initial_status" == "running" ]]; then
+      set_step "start"
+      log "VM vmid=${vmid}: restarting after resize (no Windows work)"
+      qm start "$vmid"
+      wait_for_status "$vmid" "running" "$start_timeout"
+    fi
+    set_step "success"
+    log "VM vmid=${vmid}: done"
+    return 0
   fi
 
-  if [[ "$start_after_resize" -eq 1 ]]; then
-    set_step "start"
-    log "VM vmid=${vmid}: starting"
-    qm start "$vmid"
-    wait_for_status "$vmid" "running" "$start_timeout"
-    started_now=1
-  fi
+  # ---- Windows work path: run WITHOUT vGPU so the guest agent responds ----
 
-  if [[ "$expand_windows_c" -eq 1 ]]; then
-    if [[ "$started_now" -eq 1 ]]; then
-      set_step "guest-agent"
-      log "VM vmid=${vmid}: VM was just started; waiting for Windows guest agent"
-      wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
-    else
-      ensure_guest_agent_ready "$vmid" 1
+  set_step "vgpu-detach"
+  detach_vgpu_if_present "$vmid"
+
+  set_step "start"
+  log "VM vmid=${vmid}: starting WITHOUT vGPU for guest-agent work"
+  qm start "$vmid"
+  wait_for_status "$vmid" "running" "$start_timeout"
+  started_now=1
+
+  set_step "guest-agent"
+  log "VM vmid=${vmid}: waiting for Windows guest agent (no vGPU attached)"
+  wait_for_guest_agent_after_start "$vmid" "$guest_retry_attempts" "$guest_retry_delay"
+
+  set_step "windows-check"
+  log "VM vmid=${vmid}: checking Windows disk >= ${windows_ok_gb}G and Steam running"
+  set +e
+  windows_state_check "$vmid"
+  check_rc="$?"
+  set -e
+
+  if [[ "$check_rc" -eq 0 ]]; then
+    log "VM vmid=${vmid}: Windows disk and Steam already OK"
+  else
+    if [[ "$check_rc" -ne 2 ]]; then
+      die "vmid=${vmid}: Windows check could not complete even without vGPU (rc=${check_rc}); aborting so vGPU is restored"
     fi
 
-    set_step "windows-check"
-    log "VM vmid=${vmid}: checking Windows disk >= ${windows_ok_gb}G and Steam running"
-    set +e
+    set_step "windows-repair"
+    log "VM vmid=${vmid}: repairing Windows C:, tail reserve, and Steam"
+    windows_resize_verify_and_steam "$vmid"
+
+    set_step "windows-final-check"
+    log "VM vmid=${vmid}: final Windows disk/Steam verification"
     windows_state_check "$vmid"
-    check_rc="$?"
-    set -e
-
-    if [[ "$check_rc" -eq 0 ]]; then
-      log "VM vmid=${vmid}: Windows disk and Steam already OK"
-    else
-      if [[ "$check_rc" -ne 2 ]]; then
-        log "VM vmid=${vmid}: Windows check could not complete cleanly; doing stop/start before repair"
-        stop_start_vm_for_guest_agent "$vmid"
-      fi
-
-      set_step "windows-repair"
-      log "VM vmid=${vmid}: repairing Windows C:, tail reserve, and Steam"
-      windows_resize_verify_and_steam "$vmid"
-
-      set_step "windows-final-check"
-      log "VM vmid=${vmid}: final Windows disk/Steam verification"
-      windows_state_check "$vmid"
-    fi
-  elif [[ "$did_pve_resize" -eq 0 ]]; then
-    log "VM vmid=${vmid}: no Windows work requested and PVE disk already OK"
   fi
+
+  # ---- Restore vGPU: stop, re-attach hostpci, start with vGPU ----
+
+  set_step "vgpu-restore-stop"
+  log "VM vmid=${vmid}: Windows work done; stopping to re-attach vGPU"
+  graceful_stop_vm "$vmid"
+
+  set_step "vgpu-restore"
+  restore_vgpu_if_needed "$vmid"
+
+  set_step "start-with-vgpu"
+  log "VM vmid=${vmid}: starting WITH vGPU restored"
+  qm start "$vmid"
+  wait_for_status "$vmid" "running" "$start_timeout"
 
   set_step "success"
   log "VM vmid=${vmid}: done"
@@ -1029,7 +1200,7 @@ run_vm_job() {
 
   (
     current_step="init"
-    trap 'rc=$?; trap - EXIT; printf "%s\t%s\t%s\t%s\t%s\n" "$vmid" "$rc" "$current_step" "$name" "$logfile" > "$statusfile"; exit "$rc"' EXIT
+    trap 'rc=$?; trap - EXIT; if [[ "$rc" -ne 0 ]]; then restore_vgpu_on_failure "$vmid"; fi; printf "%s\t%s\t%s\t%s\t%s\n" "$vmid" "$rc" "$current_step" "$name" "$logfile" > "$statusfile"; exit "$rc"' EXIT
     process_vm "$vmid" "$name" "$disk" "$pve_disk_gb" "$resize_increment"
   ) 2>&1 | while IFS= read -r line; do
     printf '%s [vmid=%s name=%s] %s\n' "$(date '+%F %T')" "$vmid" "$name" "$line" | tee -a "$logfile"
@@ -1079,6 +1250,9 @@ rerun_command_for_vmid() {
   fi
   if [[ "$auto_disable_watchdog" -eq 0 ]]; then
     cmd="${cmd} --no-watchdog-disable"
+  fi
+  if [[ "$manage_vgpu" -eq 0 ]]; then
+    cmd="${cmd} --no-vgpu-manage"
   fi
 
   printf '%s\n' "$cmd"
