@@ -1150,10 +1150,8 @@ process_vm() {
 
   set_step "windows-check"
   log "VM vmid=${vmid}: checking Windows disk >= ${windows_ok_gb}G and Steam running"
-  set +e
-  windows_state_check "$vmid"
-  check_rc="$?"
-  set -e
+  check_rc=0
+  windows_state_check "$vmid" || check_rc="$?"
 
   if [[ "$check_rc" -eq 0 ]]; then
     log "VM vmid=${vmid}: Windows disk and Steam already OK"
@@ -1164,11 +1162,19 @@ process_vm() {
 
     set_step "windows-repair"
     log "VM vmid=${vmid}: repairing Windows C:, tail reserve, and Steam"
-    windows_resize_verify_and_steam "$vmid"
+    local repair_rc=0
+    windows_resize_verify_and_steam "$vmid" || repair_rc="$?"
+    if [[ "$repair_rc" -ne 0 ]]; then
+      die "vmid=${vmid}: Windows C:/Steam repair failed (rc=${repair_rc})"
+    fi
 
     set_step "windows-final-check"
     log "VM vmid=${vmid}: final Windows disk/Steam verification"
-    windows_state_check "$vmid"
+    check_rc=0
+    windows_state_check "$vmid" || check_rc="$?"
+    if [[ "$check_rc" -ne 0 ]]; then
+      die "vmid=${vmid}: Windows still not OK after repair (rc=${check_rc})"
+    fi
   fi
 
   # ---- Restore vGPU: stop, re-attach hostpci, start with vGPU ----
